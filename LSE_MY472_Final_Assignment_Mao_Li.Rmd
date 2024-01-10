@@ -1,0 +1,819 @@
+---
+title: "Final assignment (summative)"
+author: "Mao Li"
+date: "2024-01-10"
+output:
+  html_document: default
+fontsize: 16pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE} 
+# Suppress warning for the formatting of the output report
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE) 
+```
+
+**Link to the Github repo: https://github.com/neo-258/MY472_Final_Assignment_Mao_Li/tree/master** 
+
+# 1. Introduction
+
+This report addresses the research question: "Are there biases in who experiences stop and search by the UK police?" It seeks to investigate whether certain groups experience a disproportionately higher likelihood of being stopped and searched based on characteristics such as ethnicity, gender, and age. The analysis focuses on ethnic bias, utilizing the R to process stop and search data alongside population data broken down by area and ethnicity. Through the computation and visualization of stop and search rates and relative rates across different ethnic groups, the research seeks to elucidate potential disparities indicative of systemic bias.
+
+```{r Install and load the required libraries}
+# Install the required libraries if not installed
+required_libraries <- c("bigrquery", "DBI", "readxl", "jsonlite", "dplyr", "readODS", "ggplot2", "ggrepel", "tidyverse", "scales")
+
+for (lib in required_libraries) {
+  if (!requireNamespace(lib, quietly = TRUE)) {
+    install.packages(lib)
+  }
+}
+
+# Load required packages
+library(tidyverse)
+library(bigrquery)
+library(DBI)
+library(readxl)
+library(jsonlite)
+library(dplyr)
+library(readODS)
+library(ggplot2)
+library(ggrepel)
+library(scales)
+```
+
+# 2. Data
+
+The analysis leverages two main datasets: population data and stop and search statistics. 
+
+Population data was obtained from the Home Office website, sourcing from the Office for National Statistics (ONS), which details ethnic compositions based on the 2021 Censuses. 
+
+Stop and search data were acquired from the UK Police Data website through the "Custom download" option, facilitating the extraction of the latest street-level stop and search information from December 2020 to November 2023. The data encompasses 43 territorial police force areas (PFAs) in England and Wales, including the British Transport Police. Rigorous data processing involved the exclusion of vehicle searches and integration of PFA and ethnicity columns, based on both self-defined and officer-observed ethnicity. The resulting dataset was stored in Google Cloud's Bigquery.
+
+Statistical analysis of stop and search numbers and overall rates per 1,000 population by ethnicity was conducted using SQL. Further, relative or disparity rates were computed by dividing the overall rates of ethnic minorities by those of whites. This process generated datasets comprising England and Wales as a whole, as well as various lower PFAs, serving as the foundation for the subsequent analysis.
+
+```{r Stop and search data collection, eval=FALSE, include=FALSE}
+ # Running code for stop and search data collection, cleaning and storing can cost long time so it is set to not run. 
+
+# The latest stop and search CSV files from December 2020 to November 2023 have been downloaded from the link "https://data.police.uk/data/" and stored in local folder as "stop-and-search-data-dec20-nov23".
+# Set the relative path to the data folder
+stop_and_search_data_folder <- "Database/stop-and-search-data-dec20-nov23"
+
+# List all subdirectories (months) in the data folder
+months_from_dec20_nov23 <- list.dirs(path = stop_and_search_data_folder, full.names = FALSE, recursive = FALSE)
+
+# Create an empty data frame to store aggregated data
+stop_and_search_data <- data.frame()
+
+# Loop through each month
+for (month in months_from_dec20_nov23) {
+  # List all CSV files in the current month's folder
+  month_folder <- file.path(stop_and_search_data_folder, month)
+  fls <- list.files(path = month_folder, pattern = ".csv", full.names = TRUE)
+
+  # Loop through each CSV file
+  for (f in fls) {
+    message(f)
+    
+    # Extract police force id from the file path
+    force_id <- sub(".*/[0-9]{4}-[0-9]{2}-(.*)-stop-and-search\\.csv", "\\1", f)
+    message(force_id)
+    
+    # Read CSV file into memory with check.names = FALSE
+    stop_and_search_file <- read.csv(f, stringsAsFactors = FALSE, check.names = FALSE)
+
+    # Add "Police Force Area" column and assign the force_id
+    stop_and_search_file$`Police force ID` <- force_id
+
+    # Append data to the aggregate data frame
+    stop_and_search_data <- rbind(stop_and_search_data, stop_and_search_file)
+  }
+}
+```
+
+```{r Stop and search data cleaning, eval=FALSE, include=FALSE}
+# Delete rows where "Type" is Vehicle search because ethnicity information is not collected during these searches
+stop_and_search_data <- stop_and_search_data[stop_and_search_data$Type != "Vehicle search", ]
+
+# Define New Column "Ethnicity", based on a combination of self-defined ethnicity and officer-observed ethnicity (where self-defined ethnicity was not stated)
+# Function to map ethnicity based on Self-defined and Officer-defined ethnicity
+map_ethnicity <- function(self_defined, officer_defined) {
+  
+  # Obtain categories using function unique()
+  # self_defined_ethnicity_categories <- unique(stop_and_search_data$`Self-defined ethnicity`)
+  # officer_defined_ethnicity_categories <- unique(stop_and_search_data$`Officer-defined ethnicity`)
+  
+  # Ethnicity categories
+  white_categories <- c("White - English/Welsh/Scottish/Northern Irish/British",
+                        "White - Any other White background", "White - Irish", 
+                        "White - Gypsy or Irish Traveller")
+  black_categories <- c("Black/African/Caribbean/Black British - African", 
+                        "Black/African/Caribbean/Black British - Caribbean", 
+                        "Black/African/Caribbean/Black British - Any other Black/African/Caribbean background")
+  asian_categories <- c("Asian/Asian British - Pakistani", "Asian/Asian British - Indian", 
+                        "Asian/Asian British - Bangladeshi", "Asian/Asian British - Chinese", 
+                        "Asian/Asian British - Any other Asian background")
+  mixed_categories <- c("Mixed/Multiple ethnic groups - White and Black African", 
+                        "Mixed/Multiple ethnic groups - White and Black Caribbean", 
+                        "Mixed/Multiple ethnic groups - Any other Mixed/Multiple ethnic background", 
+                        "Mixed/Multiple ethnic groups - White and Asian")
+  other_categories <- c("Other ethnic group - Not stated", "Other ethnic group - Any other ethnic group", 
+                        "Other ethnic group - Arab")
+  unknown_category <- "Not stated / Unknown"
+  
+  # Check if Self-defined ethnicity is not empty or NA or not stated
+  if (!is.na(self_defined) && self_defined != "" && self_defined != "Other ethnic group - Not stated") {
+    if (self_defined %in% white_categories) {
+      return("White")
+    } else if (self_defined %in% black_categories) {
+      return("Black (or Black British)")
+    } else if (self_defined %in% asian_categories) {
+      return("Asian (or Asian British)")
+    } else if (self_defined %in% mixed_categories) {
+      return("Mixed")
+    } else if (self_defined %in% other_categories) {
+      return("Other Ethnic Group")
+    } else {
+      return(unknown_category)
+    }
+  } else {
+    # If Self-defined ethnicity is empty or not stated, use Officer-defined ethnicity instead 
+    # or consider it as "Not stated / Unknown"
+    if (is.na(officer_defined) || officer_defined == "") {
+      return(unknown_category)
+    } else if (officer_defined == "White") {
+      return("White")
+    } else if (officer_defined == "Black") {
+      return("Black (or Black British)")
+    } else if (officer_defined == "Asian") {
+      return("Asian (or Asian British)")
+    } else if (officer_defined == "Mixed") {
+      return("Mixed")
+    } else if (officer_defined == "Other") {
+      return("Other Ethnic Group")
+    } else {
+      return(unknown_category)
+    }
+  }
+}
+
+# Apply the mapping function to create the "Ethnicity" column
+stop_and_search_data$Ethnicity <- mapply(map_ethnicity, stop_and_search_data$`Self-defined ethnicity`, stop_and_search_data$`Officer-defined ethnicity`)
+```
+
+```{r Set the id of cloud dataset}
+# A relational database was created in the cloud to store a variety of different but related tables using package Bigquery.
+project_name <- "my472-final-database-409622"
+billing_id <- "my472-final-database-409622"
+dataset_name <- "UK_Police_Bias_Analysis"
+```
+
+```{r Write stop and search data into cloud dataset, eval=FALSE, include=FALSE}
+# Access to the cloud dataset
+db <- dbConnect(
+  bigrquery::bigquery(),
+  project = project_name,
+  dataset = dataset_name,
+  billing = billing_id
+)
+
+# Write stop and search data into cloud database, which may have to take several minutes due to the data size
+dbWriteTable(db, "stop_and_search", stop_and_search_data, overwrite = TRUE)
+
+# Close the connection
+dbDisconnect(db)
+```
+
+```{r Data collection and cleaning of Population data by Police Force Area and ethnicity}
+# Through Home Office website 
+# (https://www.gov.uk/government/statistics/stop-and-search-and-arrests-year-ending-march-2023),  the ODS file providing population data was  downloaded and stored in the local folder as "stop-search-data-tables-summary-mar23.ods".
+
+# Specify the path to the ODS file
+population_file_path <- "Database/stop-search-data-tables-summary-mar23.ods"
+
+# Read the population ODS file
+population_data <- read_ods(path = population_file_path, sheet = "P_1", skip=3, .name_repair = "minimal")
+
+# Filter out rows with Census Year 2011
+population_data <- population_data[population_data$Census.Year == 2021, ]
+
+# Modify the column names
+colnames(population_data) <- c("Census_Year", "Geocode", "Police_Force_Area", 
+                               "Self_defined_ethnicity", "Population")
+
+# Loop through each ethnic category and replace in the column
+original_ethnicity_categories <- c("Asian or Asian British", "Black or Black British", "Mixed", "Other Ethnic Group", "White")
+
+new_ethnicity_categories <- c("Asian (or Asian British)", "Black (or Black British)", "Mixed", "Other Ethnic Group", "White")
+
+for (i in seq_along(original_ethnicity_categories)) {
+  population_data$Self_defined_ethnicity[population_data$Self_defined_ethnicity == original_ethnicity_categories[i]] <- new_ethnicity_categories[i]
+}
+
+# Initialize an empty data frame to store the aggregated data
+aggregate_population <- data.frame(
+  Census_Year = 2021,
+  Geocode = "K04000001",
+  Police_Force_Area = "England and Wales",
+  Self_defined_ethnicity = new_ethnicity_categories,
+  Population = numeric(length(new_ethnicity_categories)),
+  check.names = FALSE
+)
+
+# Loop through ethnicity categories and calculate the sum for each
+for (category in new_ethnicity_categories) {
+  population_sum <- sum(population_data$Population[population_data$Self_defined_ethnicity == category])
+  aggregate_population[aggregate_population$Self_defined_ethnicity == category, "Population"] <- population_sum
+}
+```
+
+```{r ID and names of police forces available data collection}
+# API for a list of all the police forces available except the British Transport Policeand
+pfa_api <- "https://data.police.uk/api/forces"
+pfa_data <- fromJSON(pfa_api)
+
+# Add British Transport Police to the data frame
+btp_data <- data.frame(id = "btp", name = "British Transport Police")
+pfa_data <- rbind(pfa_data, btp_data)
+
+# Obtain the categories in stop_and_search_number_pfa_2023 and population_data
+# unique(population_data$`Police Force Area`)
+# unique(pfa_data$name)
+
+# Create a mapping between the pfa categories
+mapping <- c(
+  "Avon and Somerset Constabulary" = "Avon and Somerset",
+  "British Transport Police" = "British Transport Police",
+  "Bedfordshire Police" = "Bedfordshire",
+  "Cambridgeshire Constabulary" = "Cambridgeshire",
+  "Cheshire Constabulary" = "Cheshire",
+  "City of London Police" = "London, City of",
+  "Cleveland Police" = "Cleveland",
+  "Cumbria Constabulary" = "Cumbria",
+  "Derbyshire Constabulary" = "Derbyshire",
+  "Devon & Cornwall Police" = "Devon and Cornwall",
+  "Dorset Police" = "Dorset",
+  "Durham Constabulary" = "Durham",
+  "Dyfed-Powys Police" = "Dyfed-Powys",
+  "Essex Police" = "Essex",
+  "Gloucestershire Constabulary" = "Gloucestershire",
+  "Greater Manchester Police" = "Greater Manchester",
+  "Gwent Police" = "Gwent",
+  "Hampshire Constabulary" = "Hampshire",
+  "Hertfordshire Constabulary" = "Hertfordshire",
+  "Humberside Police" = "Humberside",               
+  "Kent Police" = "Kent",
+  "Lancashire Constabulary" = "Lancashire",
+  "Leicestershire Police" = "Leicestershire",
+  "Lincolnshire Police" = "Lincolnshire",
+  "Merseyside Police" = "Merseyside",
+  "Metropolitan Police Service" = "Metropolitan Police",
+  "Norfolk Constabulary" = "Norfolk",
+  "North Wales Police" = "North Wales",
+  "North Yorkshire Police" = "North Yorkshire",
+  "Northamptonshire Police" = "Northamptonshire",
+  "Northumbria Police" = "Northumbria",
+  "Nottinghamshire Police" = "Nottinghamshire",
+  "Police Service of Northern Ireland" = "Northern Ireland",
+  "South Wales Police" = "South Wales",
+  "South Yorkshire Police" = "South Yorkshire",
+  "Staffordshire Police" = "Staffordshire",
+  "Suffolk Constabulary" = "Suffolk",
+  "Surrey Police" = "Surrey",
+  "Sussex Police" = "Sussex",
+  "Thames Valley Police" = "Thames Valley",
+  "Warwickshire Police" = "Warwickshire",
+  "West Mercia Police" = "West Mercia",
+  "West Midlands Police" = "West Midlands",
+  "West Yorkshire Police" = "West Yorkshire",
+  "Wiltshire Police" = "Wiltshire"
+)
+
+# Map PFA names using the created mapping
+pfa_data$name <- sapply(pfa_data$name, function(pfa) {
+  mapped_pfa <- mapping[pfa]
+  if (is.null(mapped_pfa)) {
+    warning(paste("No mapping found for", pfa))
+    return(pfa)
+  } else {
+    return(mapped_pfa)
+  }
+})
+
+# Access to the cloud dataset
+db <- dbConnect(
+  bigrquery::bigquery(),
+  project = project_name,
+  dataset = dataset_name,
+  billing = billing_id
+)
+
+# Write the data to the cloud database
+dbWriteTable(db, "police_force_area", pfa_data, overwrite = TRUE)
+
+# Close the connection
+dbDisconnect(db)
+```
+
+```{r 3 tables on stop and search number by Police Force Area and ethnicity from 2020/21 to 2022/23}
+# Define a function to retrieve the aggregate stop and search numbers for each year, Police Force Area, and ethnicity
+number_query <- function(start_date, end_date, year) {
+  query <- paste0("
+    SELECT
+      '", year, "' AS Year,
+      pfa.name AS Police_Force_Area,
+      s.Ethnicity,
+      COUNT(*) AS Stop_and_search_number
+    FROM
+      stop_and_search s
+    JOIN
+      police_force_area pfa ON s.`Police force ID` = pfa.id
+    WHERE
+      DATE(s.Date) BETWEEN '", start_date, "' AND '", end_date, "'
+    GROUP BY
+      Year, pfa.name, s.Ethnicity
+    ORDER BY
+      Year, pfa.name, s.Ethnicity
+  ")
+
+  result <- dbGetQuery(db, query)
+  return(result)
+}
+
+# Access to the cloud dataset
+db <- dbConnect(
+  bigrquery::bigquery(),
+  project = project_name,
+  dataset = dataset_name,
+  billing = billing_id
+)
+
+# Run the function for each table
+stop_and_search_number_pfa_2021 <- number_query("2020-12-01", "2021-11-30", "2020/2021")
+stop_and_search_number_pfa_2022 <- number_query("2021-12-01", "2022-11-30", "2021/2022")
+stop_and_search_number_pfa_2023 <- number_query("2022-12-01", "2023-11-30", "2022/2023")
+
+# Exclude rows where Ethnicity is "Not stated / Unknown"
+stop_and_search_number_pfa_2021 <- stop_and_search_number_pfa_2021[stop_and_search_number_pfa_2021$Ethnicity != "Not stated / Unknown", ]
+stop_and_search_number_pfa_2022 <- stop_and_search_number_pfa_2022[stop_and_search_number_pfa_2022$Ethnicity != "Not stated / Unknown", ]
+stop_and_search_number_pfa_2023 <- stop_and_search_number_pfa_2023[stop_and_search_number_pfa_2023$Ethnicity != "Not stated / Unknown", ]
+
+# Write the data to the cloud database
+dbWriteTable(db, "stop_and_search_number_pfa_2021", stop_and_search_number_pfa_2021, overwrite = TRUE)
+dbWriteTable(db, "stop_and_search_number_pfa_2022", stop_and_search_number_pfa_2022, overwrite = TRUE)
+dbWriteTable(db, "stop_and_search_number_pfa_2023", stop_and_search_number_pfa_2023, overwrite = TRUE)
+
+# Close the connection
+dbDisconnect(db)
+```
+
+# 3. Analysis
+
+The analysis begins by examining the stop and search numbers, with Figure 1 showing that whites have the highest count, reflecting their majority in the population. However, to address the bias question, the focus shifts to the overall stop and search and relative rates, illuminating substantial disparities between ethnic minorities, especially blacks and whites. 
+
+**Figure 1: Numbers of stop and searches by ethnicity, England and Wales, 2020/2021 to 2022/2023**
+
+```{r Aggregate numbers of stop and search by ethnicity from 2020/21 to 2022/23}
+# Function to run the query and get the results
+aggregate_number_query <- function(table_name, year) {
+  query <- paste0("
+    SELECT
+      '", year, "' AS Year,
+      'England and Wales' AS Police_Force_Area,
+      Ethnicity,
+      SUM(Stop_and_search_number) AS Stop_and_search_number
+    FROM
+      ", table_name, "
+    GROUP BY
+      Year, Police_Force_Area, Ethnicity
+    ORDER BY
+      Year, Ethnicity
+  ")
+
+  result <- dbGetQuery(db, query)
+  return(result)
+}
+
+# Access to the cloud dataset
+db <- dbConnect(
+  bigrquery::bigquery(),
+  project = project_name,
+  dataset = dataset_name,
+  billing = billing_id
+)
+
+# Run the function for each table
+aggregate_number_2021 <- aggregate_number_query("stop_and_search_number_pfa_2021", "2020/2021")
+aggregate_number_2022 <- aggregate_number_query("stop_and_search_number_pfa_2022", "2021/2022")
+aggregate_number_2023 <- aggregate_number_query("stop_and_search_number_pfa_2023", "2022/2023")
+
+aggregate_stop_and_search_number <- rbind(
+  aggregate_number_2021,
+  aggregate_number_2022, 
+  aggregate_number_2023
+  )
+
+# Close the connection
+dbDisconnect(db)
+```
+
+```{r Bar Chart for Aggregate numbers of stop and search}
+# Define custom order for Ethnicity levels
+aggregate_number_custom_order <- c("White",
+                                    "All Ethnic Minority Groups",
+                                    "Other Ethnic Group",
+                                    "Mixed",
+                                    "Black (or Black British)",
+                                    "Asian (or Asian British)"
+)
+
+# Apply custom order to the Ethnicity column
+aggregate_stop_and_search_number$Ethnicity <- factor(aggregate_stop_and_search_number$Ethnicity, levels = aggregate_number_custom_order)
+
+# Create a bar chart
+chart_aggregate_number <- ggplot(aggregate_stop_and_search_number, aes(x = as.numeric(Stop_and_search_number), y = Ethnicity, fill = Year)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_text(aes(label = comma(as.numeric(Stop_and_search_number))), position = position_dodge(width = 0.7), vjust = 0.5, hjust = -0.5, size = 3) +
+  scale_fill_manual(values = c("lightblue", "blue", "darkblue")) +
+  theme_minimal() +  # Use a minimal theme
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.minor.x = element_blank(),  # Remove gridlines
+    axis.title.x = element_text(face = "bold"),  # Make x-axis title bold
+    axis.title.y = element_text(face = "bold"),  # Make y-axis title bold
+    axis.text.x = element_text(size = 10),  # Adjust x-axis label size
+    axis.text.y = element_text(size = 10)
+  ) +
+  labs(x = "Stop and search number", y = "Ethnicity") +
+  scale_x_continuous(limits = c(0, 350000), breaks = seq(0, 350000, by = 50000), expand = c(0, 50000), labels = comma)
+
+# Print the chart
+print(chart_aggregate_number)
+```
+
+In Figure 2, in the year ending November 2023, black or black British individuals experienced searches at a rate 5.6 times higher than their white counterparts. Asians and mixed ethnicities similarly faced elevated, though varying rates. The stop-and-search bias against ethnic minorities, particularly the black community, persists at the national level, a declining trend in overall and relative rates has emerged in the last three years.
+
+**Figure 2: Overall stop and search rates per 1,000 population by ethnicity, England and Wales, 2020/2021 to 2022/2023**
+
+```{r Overall stop and searche rates}
+# Function to calculate overall rates
+calculate_overall_rate <- function(stop_and_search_number, population) {
+  # Overall rates are rounded to the integer digits using the round-half-away-from-zero method.
+  overall_rate <- round(sum(stop_and_search_number) / sum(population) * 1000)
+  return(overall_rate)
+}
+
+# Create vectors to store results
+years <- unique(aggregate_stop_and_search_number$Year)
+ethnicities <- unique(aggregate_stop_and_search_number$Ethnicity)
+
+# Initialize data frame to store results
+overall_rate_df <- data.frame(Year = character(), Police_Force_Area = character(), Ethnicity = character(), Overall_rate_per_1000 = numeric())
+
+# Define ethnic minority categories
+ethnic_minority_categories <- c("Asian (or Asian British)", "Black (or Black British)", "Mixed", "Other Ethnic Group")
+
+# Loop through each year and ethnicity
+for (year in years) {
+  minorities_num <- 0
+  minorities_pop <- 0
+  
+  for (ethnicity in ethnicities) {
+    # Extract stop search number
+    stop_search <- aggregate_stop_and_search_number$Stop_and_search_number[aggregate_stop_and_search_number$Year == year & aggregate_stop_and_search_number$Ethnicity == ethnicity]
+    
+    # Extract population number
+    population <- aggregate_population$Population[aggregate_population$Self_defined_ethnicity == ethnicity]
+    
+    # Calculate rate
+    rate <- calculate_overall_rate(stop_search, population)
+    
+    # Append to result dataframe
+    overall_rate_df <- rbind(overall_rate_df, data.frame(Year = year, Police_Force_Area = "England and Wales", Ethnicity = ethnicity, Overall_rate_per_1000 = rate))
+    
+    if (ethnicity %in% ethnic_minority_categories) {
+      minorities_num <- minorities_num + stop_search
+      minorities_pop <- minorities_pop + population
+    }
+  }
+  
+  # Calculate All Ethnic Minority Groups rate
+  all_minority_rate <- calculate_overall_rate(minorities_num, minorities_pop)
+  
+  overall_rate_df <- rbind(overall_rate_df, data.frame(Year = year, Police_Force_Area = "England and Wales", Ethnicity = "All Ethnic Minority Groups", Overall_rate_per_1000 = all_minority_rate))
+}
+```
+
+```{r Bar Chart for overall stop and searche rates}
+# Define the custom order for Ethnicity
+overall_rate_custom_order <- c("White",
+                               "All Ethnic Minority Groups",
+                               "Other Ethnic Group",
+                               "Mixed",
+                               "Black (or Black British)",
+                               "Asian (or Asian British)" 
+                               )
+                               
+# Set the factor levels for Ethnicity based on the custom order
+overall_rate_df$Ethnicity <- factor(overall_rate_df$Ethnicity, levels = overall_rate_custom_order)
+
+# Create a bar plot for overall rates
+chart_overall_rate <- ggplot(overall_rate_df, aes(x = as.numeric(Overall_rate_per_1000), y = Ethnicity, fill = Year)) +
+  geom_col(position = "dodge", width = 0.7) +  # Bar plot
+  geom_text(aes(label = as.numeric(Overall_rate_per_1000)), position = position_dodge(width = 0.7), vjust = 0.5, hjust= -0.5, size = 3) +  # Add text labels
+  scale_fill_manual(values = c("lightblue", "blue", "darkblue")) +  # Custom fill colors
+  theme_minimal() +  # Use a minimal theme
+  theme(
+    legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal",
+    panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank(), panel.grid.minor.x = element_blank(),  # Remove gridlines
+    axis.title.x = element_text(face = "bold"),  # Make x-axis title bold
+    axis.title.y = element_text(face = "bold"),  # Make y-axis title bold
+    axis.text.x = element_text(size = 10),  # Adjust x-axis label size
+    axis.text.y = element_text(size = 10)  # Adjust y-axis label size
+  ) +
+  labs(x = "Overall Rate per 1000", y = "Ethnicity") +  # Axis labels
+  scale_x_continuous(limits = c(0, 45), breaks = seq(0, 45, by = 5), expand = c(0, 1))  # X-axis settings
+
+# Print the plot
+print(chart_overall_rate)
+```
+
+**Figure 3: Relative stop and search rates by ethnicity, England and Wales, 2020/2021 to 2022/2023**
+```{r Relative stop and searche rates for ethnic minority in comparison to white from 2020/21 to 2022/23}
+# Initialize an empty data frame to store the results
+relative_rate_df <- data.frame()
+
+# Get unique years and ethnicities
+years <- unique(overall_rate_df$Year)
+ethnicities <- unique(overall_rate_df$Ethnicity)
+
+all_ethnicity_categories <- c("Asian (or Asian British)", "Black (or Black British)", "Mixed", "Other Ethnic Group","All Ethnic Minority Groups", "White")
+
+# Nested loops to calculate relative rates
+for (year in years) {
+  # Filter overall rate for the current year and white
+  white_rate <- overall_rate_df %>%
+    filter(Year == year, Ethnicity == "White")
+  
+  for (ethnicity in ethnicities) {
+    
+    # Check if the ethnicity is in the specified categories
+    if (ethnicity %in% all_ethnicity_categories) {
+      
+      # Filter data for the current year and ethnicity
+      minority_data <- overall_rate_df %>%
+        filter(Year == year, Ethnicity == ethnicity)
+      
+      # Calculate the Overall_rate_per_1000 for White
+      white_rate <- overall_rate_df %>%
+        filter(Year == year, Ethnicity == "White") %>%
+        select(Police_Force_Area, Overall_rate_per_1000) %>%
+        rename(White_rate = Overall_rate_per_1000)
+      
+      # Calculate Relative rate
+      relative_rate <- minority_data %>%
+        left_join(white_rate, by = "Police_Force_Area") %>%
+        # relative rates are rounded to the tenth place using the round-half-away-from-zero method.
+        mutate(Relative_rate = round(Overall_rate_per_1000 / White_rate, 1) ) %>%
+        select(Year, Police_Force_Area, Ethnicity, Relative_rate)
+      
+      # Append the result to the final data frame
+      relative_rate_df <- bind_rows(relative_rate_df, relative_rate)
+    }
+  }
+}
+```
+
+```{r Bar Chart for relative stop and searche rates}
+# Bar Chart for relative stop and search rates
+# Specify the desired order for the "Ethnicity" variable in the chart
+relative_rate_custom_order <- c("White",
+                                "All Ethnic Minority Groups",
+                                "Other Ethnic Group",
+                                "Mixed",
+                                "Black (or Black British)",
+                                "Asian (or Asian British)"
+)
+
+relative_rate_df$Ethnicity <- factor(relative_rate_df$Ethnicity, levels = relative_rate_custom_order)
+
+chart_relative_rate <- 
+  ggplot(relative_rate_df, aes(x = as.numeric(Relative_rate), y = Ethnicity, fill = Year)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_text(aes(label = as.numeric(Relative_rate)), position = position_dodge(width = 0.7), vjust = 0.5, hjust= -0.5, size = 3) +  # Add text labels
+  scale_fill_manual(values = c("lightblue", "blue", "darkblue")) +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal",
+        panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank(), panel.grid.minor.x = element_blank(),
+        axis.title.x = element_text(face = "bold"),  # Make x-axis title bold
+        axis.title.y = element_text(face = "bold"),  # Make y-axis title bold
+        axis.text.x = element_text(size = 10),  # Adjust x-axis label size
+        axis.text.y = element_text(size = 10)  # Adjust y-axis label size
+  ) +
+  labs(x = "Relative stop and search rate for ethnic minority compared with white", y = "Ethnicity") +
+  scale_x_continuous(limits = c(0, 6.5), breaks = seq(0, 6.5, by = 0.5), expand = c(0, 1))
+
+print(chart_relative_rate)
+```
+
+Further refinement at the district level exposes variations in disparities across different PFAs in England and Wales. Figure 4 compares stop and search disparity rates against overall rates for blacks and all minorities at the PFA level. Notably, the Merseyside and Cumbria police forces exhibit the highest overall stop and search rates for blacks and minorities. Dorset and Gloucestershire had by far the highest relative rates for blacks and minorities. However, this result is related to the relatively low number of searches and minority population. Caution is advised when interpreting national-level figures and the seriousness of bias in various regions, considering relative rates and search numbers, as well as ethnic composition.
+
+**Figure 4: Overall stop and search rates and relative rates for ethnic minorities, by Police Force Area, England and Wales, year ending November 2023**
+```{r Overall stop and search rates by Police Force Area and ethnicity in 2022/23}
+# Initialize an empty data frame to store the results
+overall_rate_pfa_2023 <- data.frame(
+  Year = character(),
+  Police_Force_Area = character(),
+  Ethnicity = character(),
+  Overall_rate_per_1000 = numeric()
+)
+
+# Get unique Police_Force_Area and Ethnicity values
+pfas <- unique(stop_and_search_number_pfa_2023$Police_Force_Area)
+ethnicities <- unique(stop_and_search_number_pfa_2023$Ethnicity)
+
+# Nested loops to calculate overall rates
+for (pfa in pfas) {
+  minorities_num_pfa <- 0
+  minorities_pop_pfa <- 0
+
+  for (ethnicity in ethnicities) {
+    # Filter data from stop_and_search_number_pfa_2023
+    stop_search_data <- stop_and_search_number_pfa_2023 %>%
+      filter(Police_Force_Area == pfa, Ethnicity == ethnicity)
+
+    # Filter data from population_data
+    population_data_subset <- population_data %>%
+      filter(Police_Force_Area == pfa, Self_defined_ethnicity == ethnicity)
+
+    # Check if data is available for both stop_and_search and population
+    if (nrow(stop_search_data) > 0 && nrow(population_data_subset) > 0) {
+
+      # Calculate overall rate
+      overall_rate_value <- calculate_overall_rate(
+        stop_search_data$Stop_and_search_number,
+        population_data_subset$Population
+      )
+
+      # Create a data frame with the result
+      result_df <- data.frame(
+        Year = "2022/2023",
+        Police_Force_Area = pfa,
+        Ethnicity = ethnicity,
+        Overall_rate_per_1000 = overall_rate_value
+      )
+
+      # Append the result to the overall_rate_pfa_2023 data frame
+      overall_rate_pfa_2023 <- bind_rows(overall_rate_pfa_2023, result_df)
+
+      if (ethnicity %in% ethnic_minority_categories) {
+        minorities_num_pfa <- minorities_num_pfa + stop_search_data$Stop_and_search_number
+        minorities_pop_pfa <- minorities_pop_pfa + population_data_subset$Population
+      }
+    }
+  }
+  # Calculate All Ethnic Minority Groups rate for an area
+  all_minority_rate <- calculate_overall_rate(minorities_num_pfa, minorities_pop_pfa)
+  
+  overall_rate_pfa_2023 <- bind_rows(
+    overall_rate_pfa_2023,
+    data.frame(
+      Year = "2022/2023",
+      Police_Force_Area = pfa,
+      Ethnicity = "All Ethnic Minority Groups",
+      Overall_rate_per_1000 = all_minority_rate
+    )
+  )
+}
+
+# Exclude rows where Police Force Area is "British Transport Police" and "London, City of", 
+# because the small resident population and large transient population in City of London means that rates can be misleading. 
+# However, they still have been included in the England and Wales total when calculating overall and relative rates.
+overall_rate_pfa_2023 <- overall_rate_pfa_2023[overall_rate_pfa_2023$Police_Force_Area != "British Transport Police", ]
+overall_rate_pfa_2023 <- overall_rate_pfa_2023[overall_rate_pfa_2023$Police_Force_Area != "London, City of", ]
+
+```
+
+```{r Relative stop and search rates for minority individuals by Police Force Area in 2022/2023 compared to white}
+# Initialize an empty data frame to store the results
+relative_rate_pfa_2023 <- data.frame(
+  Year = character(),
+  Police_Force_Area = character(),
+  Ethnicity = character(),
+  Relative_rate = numeric()
+)
+
+# Get unique years and ethnicities excluding "White"
+pfas <- unique(overall_rate_pfa_2023$Police_Force_Area)
+ethnicities_no_white <- setdiff(unique(overall_rate_pfa_2023$Ethnicity), "White")
+
+# Nested loops to calculate relative rates
+for (pfa in pfas) {
+  
+  # Filter overall rate for "White" from overall_rate_pfa_2023
+  white_overall_rate <- overall_rate_pfa_2023 %>%
+    filter(Police_Force_Area == pfa, Ethnicity == "White")
+    
+  for (ethnicity in ethnicities_no_white) {
+    
+    # Filter overall rate for the current ethnicity from overall_rate_pfa_2023
+    overall_rate <- overall_rate_pfa_2023 %>%
+      filter(Police_Force_Area == pfa, Ethnicity == ethnicity)
+    
+    # Check if data is available for both "White" and the current ethnicity
+    if (nrow(white_overall_rate) > 0 && nrow(overall_rate) > 0) {
+      
+      # Calculate relative rate
+      relative_rate_value <- round(
+        overall_rate$Overall_rate_per_1000 / white_overall_rate$Overall_rate_per_1000,
+        1
+      )
+
+      # Create a data frame with the result
+      result_df <- data.frame(
+        Year = "2022/2023",
+        Police_Force_Area = pfa,
+        Ethnicity = ethnicity,
+        Relative_rate = relative_rate_value
+      )
+      
+      # Append the result to the relative_rate_pfa_2023 data frame
+      relative_rate_pfa_2023 <- bind_rows(relative_rate_pfa_2023, result_df)
+    }
+  }
+}
+```
+
+```{r Scatter plots for overall and relative rates by Police Force Area in 2022/2023}
+# Filter data for the specific ethnicity
+overall_ethnicity_data_black <- overall_rate_pfa_2023 %>%
+  filter(Ethnicity == "Black (or Black British)")
+
+relative_ethnicity_data_black <- relative_rate_pfa_2023 %>%
+  filter(Ethnicity == "Black (or Black British)")
+
+# Create scatter plot
+plot_black <- ggplot(data = relative_ethnicity_data_black, aes(x = Relative_rate, y = overall_ethnicity_data_black$Overall_rate_per_1000)) +
+  geom_point(color = "blue", size = 3) +
+  geom_text_repel(aes(label = Police_Force_Area), size = 3, color = "black", box.padding = 0.5, max.overlaps = 12) +
+  theme_minimal() +
+  scale_x_continuous(limits = c(0, 12), expand = c(0, 0), name = "Relative Rate of Stop and Searches for Black Ethnic Group Compared with White") +
+  scale_y_continuous(limits = c(0, 70), expand = c(0, 0), name = "Overall Rate for Black per thousand") +    
+  theme(
+    axis.text = element_text(size = 10, face = "plain"), 
+    axis.title = element_text(size = 10, face = "bold"), 
+    axis.line = element_line(color = "black", size = 0.5, linetype = "solid")) +
+  labs(x = NULL, y = NULL)
+
+# Filter data for the specific ethnicity
+overall_ethnicity_data_all_other <- overall_rate_pfa_2023 %>%
+  filter(Ethnicity == "All Ethnic Minority Groups")
+
+relative_ethnicity_data_all_other <- relative_rate_pfa_2023 %>%
+  filter(Ethnicity == "All Ethnic Minority Groups")
+
+# Create scatter plot
+plot_all_other <- ggplot(data = relative_ethnicity_data_all_other, aes(x = Relative_rate, y = overall_ethnicity_data_all_other$Overall_rate_per_1000)) +
+  geom_point(color = "blue", size = 3) +
+  geom_text_repel(aes(label = Police_Force_Area), size = 3, color = "black", box.padding = 0.5, max.overlaps = 10) +
+  theme_minimal() +
+  scale_x_continuous(limits = c(0, 4.5), expand = c(0, 0), name = "Relative Rate of Stop and Searches for All Ethnic Minority Groups Compared with White") +
+  scale_y_continuous(limits = c(0, 45), expand = c(0, 0), name = "Overall Rate for All Ethnic Minority Groups per thousand") +    
+  theme(
+    axis.text = element_text(size = 10, face = "plain"), 
+    axis.title = element_text(size = 10, face = "bold"), 
+    axis.line = element_line(color = "black", size = 0.5, linetype = "solid")) +
+  labs(x = NULL, y = NULL)
+
+print(plot_black)
+```
+
+```{r }
+print(plot_all_other)
+```
+
+The interpretation of the bias question using stop and search rates based on population is subject to two dataset quality issues. First, population data relies on 2021 Census data, which is nearly three years old and may not account for changes in British demographics. Additionally, the population data is based on residential estimates and does not include the transient population like visitors, which may be recorded in search data. Second, concerns about stop and search data quality, such as underreporting or inaccuracies, and the inability of several police forces to provide data may impact the accuracy of the findings. 
+
+Lastly, the analysis acknowledges that the proportion of stop and search may not conclusively prove bias exists. For example, higher criminal rates in certain ethnic groups, suggesting a higher likelihood of criminal activity,  can contribute to an increased probability of being searched, which shouldn't be automatically indicative of ethnic bias.
+
+## Reference: 
+
+UK Police (2023). data.police.uk. Available at: https://data.police.uk/ (Accessed: 09 January 2024).
+
+Home Office (2023). Stop and search and arrests, year ending March 2023. Available at: https://www.gov.uk/government/statistics/stop-and-search-and-arrests-year-ending-march-2023 (Accessed: 09 January 2024).
+
+Home Office (2023). Stop and search and arrests, year ending March 2023. Available at: https://www.ethnicity-facts-figures.service.gov.uk/crime-justice-and-the-law/policing/stop-and-search/latest/ (Accessed: 09 January 2024).
+
+Home Office (2023). Update to stop and search and arrests statistics using 2021 Census estimates. Available at: https://www.gov.uk/government/statistics/update-to-stop-and-search-and-arrests-statistics-using-2021-census-estimates/update-to-stop-and-search-and-arrests-statistics-using-2021-census-estimates (Accessed: 09 January 2024).
+
+Race Disparity Unit. Stop and search data and the effect of geographical differences. Available at: https://www.gov.uk/government/publications/stop-and-search-data-and-the-effect-of-geographical-differences/stop-and-search-interpreting-and-describing-statistics (Accessed: 09 January 2024).
+
+# 4. Code Appendix
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+# this chunk generates the complete code appendix.
+```
